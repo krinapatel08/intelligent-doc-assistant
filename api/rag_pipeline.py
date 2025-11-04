@@ -4,16 +4,13 @@ import pdfplumber
 import pytesseract
 from PIL import Image
 from dotenv import load_dotenv
-
 from langchain_core.documents import Document as LDocument
-from langchain_google_genai import GoogleGenerativeAIEmbeddings
-from langchain_chroma import Chroma  # ✅ new import
+from langchain_huggingface import HuggingFaceEmbeddings
+from langchain_chroma import Chroma
 
 load_dotenv()
 
 CHROMA_DIR = os.getenv("CHROMA_PERSIST_DIR", "./chroma_db")
-GOOGLE_API_KEY = os.getenv("GEMINI_API_KEY")
-
 
 def extract_text_from_pdf(path):
     """Extract text from PDF (pdfplumber → fallback PyMuPDF)."""
@@ -53,10 +50,8 @@ def chunk_text(text, size=1000, overlap=200):
     return chunks
 
 
-from langchain_huggingface import HuggingFaceEmbeddings
-from langchain_chroma import Chroma
-
 def get_chroma_vstore():
+    """Return or create Chroma vector store."""
     embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
     vstore = Chroma(
         collection_name="documents",
@@ -64,8 +59,6 @@ def get_chroma_vstore():
         embedding_function=embeddings,
     )
     return vstore
-
-
 
 
 def index_document(document_obj, file_path):

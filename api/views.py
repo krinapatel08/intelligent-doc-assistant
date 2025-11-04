@@ -20,6 +20,11 @@ from .serializers import (
     RegisterSerializer,
 )
 from .rag_utils import get_chroma_vstore, generate_answer, index_document
+from rest_framework.decorators import api_view
+from rest_framework.response import Response
+from rest_framework import status
+from .models import ChatHistory
+
 
 
 # ===============================
@@ -198,3 +203,13 @@ class ChatHistoryView(APIView):
             document__id=document_id, document__owner=request.user
         ).order_by("-created_at")
         return Response(ChatHistorySerializer(chats, many=True).data)
+
+
+@api_view(['DELETE'])
+def delete_chat(request, chat_id):
+    try:
+        chat = ChatHistory.objects.get(id=chat_id)
+        chat.delete()
+        return Response({"message": "Chat deleted successfully."}, status=status.HTTP_200_OK)
+    except ChatHistory.DoesNotExist:
+        return Response({"error": "Chat not found."}, status=status.HTTP_404_NOT_FOUND)
