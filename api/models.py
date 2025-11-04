@@ -1,13 +1,16 @@
 from django.db import models
+from django.contrib.auth.models import User
 
 class Document(models.Model):
-    file = models.FileField(upload_to="documents/", null=True, blank=True)
-    title = models.CharField(max_length=512, blank=True)
-    text = models.TextField(blank=True)  # extracted text
+    owner = models.ForeignKey(User, on_delete=models.CASCADE)
+    title = models.CharField(max_length=255)
+    file = models.FileField(upload_to='documents/')
+    text = models.TextField(blank=True, null=True)  # ✅ Add this line
     created_at = models.DateTimeField(auto_now_add=True)
 
     def __str__(self):
-        return self.title or f"Document {self.id}"
+        return self.title
+
 
 class Chunk(models.Model):
     document = models.ForeignKey(Document, on_delete=models.CASCADE, related_name="chunks")

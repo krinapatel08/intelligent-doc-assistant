@@ -1,0 +1,10 @@
+venv/
+__pycache__/
+*.pyc
+*.sqlite3
+.env
+documents/
+db/
+chroma_db/
+smart_doc.pdf
+frontend/node_modules/

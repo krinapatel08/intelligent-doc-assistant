@@ -1,22 +1,22 @@
 import os
-import fitz 
+import fitz
 import pdfplumber
 import pytesseract
 from PIL import Image
-from .vector_store import get_collection
-from langchain_core.documents import Document as LDocument
-
-from langchain_community.vectorstores import Chroma
-
-from langchain_google_genai import GoogleGenerativeAIEmbeddings
-
 from dotenv import load_dotenv
+
+from langchain_core.documents import Document as LDocument
+from langchain_google_genai import GoogleGenerativeAIEmbeddings
+from langchain_chroma import Chroma  # ✅ new import
+
 load_dotenv()
 
-OPENAI_KEY = os.getenv("OPENAI_API_KEY")  # optional
 CHROMA_DIR = os.getenv("CHROMA_PERSIST_DIR", "./chroma_db")
+GOOGLE_API_KEY = os.getenv("GEMINI_API_KEY")
+
 
 def extract_text_from_pdf(path):
+    """Extract text from PDF (pdfplumber → fallback PyMuPDF)."""
     texts = []
     try:
         with pdfplumber.open(path) as pdf:
@@ -25,7 +25,6 @@ def extract_text_from_pdf(path):
                 if txt:
                     texts.append(txt)
     except Exception:
-        # fallback to PyMuPDF
         doc = fitz.open(path)
         for page in doc:
             txt = page.get_text()
@@ -33,14 +32,18 @@ def extract_text_from_pdf(path):
                 texts.append(txt)
     return "\n".join(texts)
 
+
 def extract_text_from_image(path):
+    """OCR text from image."""
     try:
         img = Image.open(path)
         return pytesseract.image_to_string(img)
     except Exception:
         return ""
 
+
 def chunk_text(text, size=1000, overlap=200):
+    """Chunk long text for embedding."""
     chunks = []
     start = 0
     while start < len(text):
@@ -49,41 +52,47 @@ def chunk_text(text, size=1000, overlap=200):
         start += size - overlap
     return chunks
 
+
+from langchain_huggingface import HuggingFaceEmbeddings
+from langchain_chroma import Chroma
+
 def get_chroma_vstore():
-    # Use LangChain's Chroma wrapper with OpenAIEmbeddings if available
-    if OPENAI_KEY:
-        embedding = OpenAIEmbeddings()
-        return Chroma(persist_directory=CHROMA_DIR, embedding_function=embedding)
-    # fallback: use plain chroma collection
-    coll = get_collection()
-    return coll
+    embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
+    vstore = Chroma(
+        collection_name="documents",
+        persist_directory=CHROMA_DIR,
+        embedding_function=embeddings,
+    )
+    return vstore
+
+
+
 
 def index_document(document_obj, file_path):
-    # detect by extension
+    """Extract text and store embeddings in Chroma."""
     lower = file_path.lower()
+
+    # Detect file type
     if lower.endswith(".pdf"):
         text = extract_text_from_pdf(file_path)
     elif lower.endswith((".png", ".jpg", ".jpeg", ".tiff")):
         text = extract_text_from_image(file_path)
     else:
-        # for txt or other: read raw text
         try:
             with open(file_path, "r", encoding="utf-8") as f:
                 text = f.read()
-        except:
+        except Exception:
             text = ""
 
-    # save extracted text into document model (caller should pass model)
     chunks = chunk_text(text)
-    # Add to Chroma via LangChain wrapper if available
+
     try:
         vstore = get_chroma_vstore()
         docs = [LDocument(page_content=c, metadata={"source": str(document_obj.id)}) for c in chunks]
         vstore.add_documents(docs)
         vstore.persist()
+        print(f"✅ Indexed {len(chunks)} chunks into Chroma")
     except Exception as e:
-        # fallback: add to collection directly
-        coll = get_collection()
-        ids = [f"{document_obj.id}_{i}" for i in range(len(chunks))]
-        coll.add(documents=chunks, ids=ids)
+        print(f"⚠️ Chunk/indexing error: {e}")
+
     return text

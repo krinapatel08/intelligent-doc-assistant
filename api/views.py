@@ -1,65 +1,200 @@
 import os
+from pathlib import Path
+import pdfplumber
+from pdf2image import convert_from_path
+import pytesseract
+
+from rest_framework import status, permissions, viewsets
 from rest_framework.views import APIView
 from rest_framework.response import Response
-from rest_framework import status
-from django.conf import settings
-from .models import Document, Chunk, ChatHistory
-from .serializers import DocumentSerializer, ChatHistorySerializer
-from .rag_pipeline import index_document, get_chroma_vstore
-from .vector_store import get_collection
-from .gemini_wrapper import generate_answer
-from django.core.files.storage import default_storage
+from rest_framework.parsers import MultiPartParser, FormParser
+from rest_framework_simplejwt.tokens import RefreshToken
+from django.contrib.auth import authenticate
 
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from .models import Document, ChatHistory
+from .serializers import (
+    DocumentSerializer,
+    ChatHistorySerializer,
+    UserSerializer,
+    RegisterSerializer,
+)
+from .rag_utils import get_chroma_vstore, generate_answer, index_document
+
+
+# ===============================
+# 🔐 AUTHENTICATION
+# ===============================
+class RegisterView(APIView):
+    permission_classes = [permissions.AllowAny]
+
+    def post(self, request):
+        serializer = RegisterSerializer(data=request.data)
+        if serializer.is_valid():
+            user = serializer.save()
+            refresh = RefreshToken.for_user(user)
+            return Response(
+                {
+                    "user": UserSerializer(user).data,
+                    "refresh": str(refresh),
+                    "access": str(refresh.access_token),
+                },
+                status=201,
+            )
+        return Response(serializer.errors, status=400)
+
+
+class LoginView(APIView):
+    permission_classes = [permissions.AllowAny]
+
+    def post(self, request):
+        username = request.data.get("username")
+        password = request.data.get("password")
+        user = authenticate(username=username, password=password)
+        if not user:
+            return Response({"error": "Invalid credentials"}, status=400)
+
+        refresh = RefreshToken.for_user(user)
+        return Response(
+            {
+                "user": UserSerializer(user).data,
+                "refresh": str(refresh),
+                "access": str(refresh.access_token),
+            }
+        )
+
+
+# ===============================
+# 📄 UPLOAD DOCUMENT
+# ===============================
 class UploadDocumentView(APIView):
+    permission_classes = [permissions.IsAuthenticated]
+
     def post(self, request):
         f = request.FILES.get("file")
-        title = request.data.get("title") or (f.name if f else "untitled")
         if not f:
-            return Response({"error": "no file"}, status=status.HTTP_400_BAD_REQUEST)
-        doc = Document.objects.create(file=f, title=title)
-        path = doc.file.path
-        # extract, index and save text
+            return Response({"error": "No file uploaded"}, status=status.HTTP_400_BAD_REQUEST)
+
+        title = request.data.get("title") or f.name
+        doc = Document.objects.create(file=f, title=title, owner=request.user)
+        text = ""
+
         try:
-            text = index_document(doc, path)
-            doc.text = text
-            doc.save()
+            text = index_document(doc, doc.file.path)
         except Exception as e:
-            print("index error:", e)
+            print("⚠️ RAG index error:", e)
+
+        # Fallback 1️⃣: PyPDF2 extraction
+        if not text:
+            try:
+                from PyPDF2 import PdfReader
+                reader = PdfReader(doc.file.path)
+                for page in reader.pages:
+                    text += page.extract_text() or ""
+            except Exception as e:
+                print("⚠️ PDF extract error:", e)
+
+        # Fallback 2️⃣: OCR (for scanned PDFs)
+        if not text.strip():
+            try:
+                print("🧠 Running OCR extraction...")
+                images = convert_from_path(doc.file.path)
+                for image in images:
+                    text += pytesseract.image_to_string(image)
+            except Exception as e:
+                print("⚠️ OCR extract error:", e)
+
+        doc.text = text
+        doc.save()
+
         serializer = DocumentSerializer(doc)
         return Response(serializer.data, status=status.HTTP_201_CREATED)
 
+
+# ===============================
+# 📚 DOCUMENT VIEWSET
+# ===============================
+class DocumentViewSet(viewsets.ModelViewSet):
+    serializer_class = DocumentSerializer
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get_queryset(self):
+        return Document.objects.filter(owner=self.request.user)
+
+
+# ===============================
+# 💬 ASK QUESTION (RAG)
+# ===============================
+# ===============================
+# 💬 ASK QUESTION (RAG)
+# ===============================
 class AskQuestionView(APIView):
+    permission_classes = [permissions.IsAuthenticated]
+
     def post(self, request):
-        doc_id = request.data.get("document_id")
         question = request.data.get("question")
-        if not question:
-            return Response({"error":"no question"}, status=status.HTTP_400_BAD_REQUEST)
-        doc = None
-        if doc_id:
-            try:
-                doc = Document.objects.get(id=doc_id)
-            except Document.DoesNotExist:
-                doc = None
+        doc_id = request.data.get("document_id")
 
-        # retrieve top chunks from Chroma
+        if not question or not doc_id:
+            return Response({"error": "Missing document_id or question"}, status=400)
+
         try:
-            coll = get_chroma_vstore()
-            # Use LangChain Chroma object interface if present
-            retriever = None
-            try:
-                retriever = coll.as_retriever(search_kwargs={"k":4})
-                docs = retriever.get_relevant_documents(question)
-                context = "\n\n".join([d.page_content for d in docs])
-            except Exception:
-                # fallback to chroma direct query
-                col = get_collection()
-                res = col.query(query_texts=[question], n_results=4)
-                context = " ".join(res.get("documents", [[]])[0])
-        except Exception as e:
-            context = ""
+            document = Document.objects.get(id=doc_id, owner=request.user)
+        except Document.DoesNotExist:
+            return Response({"error": "Document not found or access denied"}, status=404)
 
-        prompt = f"Context:\n{context}\n\nQuestion: {question}\nAnswer:"
-        answer = generate_answer(prompt)
-        # save chat
-        ChatHistory.objects.create(document=doc, question=question, answer=answer)
-        return Response({"answer": answer})
+        # 🧩 Prevent NoneType errors
+        if not document.text:
+            document.text = ""
+        context = ""
+
+        try:
+            doc_vector_path = Path(f"db/doc_{document.id}")
+            vstore = get_chroma_vstore(str(doc_vector_path))
+            results = vstore.similarity_search(question, k=3)
+            context = "\n".join([r.page_content for r in results]) if results else ""
+        except Exception as e:
+            print("⚠️ Vector search error:", e)
+            context = (document.text or "")[:1500]
+
+        if not context.strip():
+            print("⚠️ Using fallback: document.text for context")
+            context = (document.text or "")[:1500]
+
+        if not context.strip():
+            return Response(
+                {"error": "Document has no readable text to answer from."},
+                status=400,
+            )
+
+        prompt = f"""
+You are an intelligent document assistant.
+Use only the context below to answer the question.
+
+Context:
+{context}
+
+Question:
+{question}
+
+Answer:
+"""
+
+        answer = generate_answer(prompt, context)
+
+        ChatHistory.objects.create(document=document, question=question, answer=answer)
+
+        return Response({"answer": answer}, status=status.HTTP_200_OK)
+
+
+# ===============================
+# 🕘 CHAT HISTORY
+# ===============================
+class ChatHistoryView(APIView):
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request, document_id):
+        chats = ChatHistory.objects.filter(
+            document__id=document_id, document__owner=request.user
+        ).order_by("-created_at")
+        return Response(ChatHistorySerializer(chats, many=True).data)
